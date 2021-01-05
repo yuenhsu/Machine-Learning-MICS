@@ -1,0 +1,305 @@
+---
+title: "Machine learning with MICS microdata"
+subtitle: "Predicting the use of contraception"
+author: "Yu-En"
+date: "05/01/2021"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, cache = TRUE)
+```
+
+## Introduction
+
+The purpose of the repository is to demonstrate how to use `caret` to build classification models. This document contains the scripts for machine learning models that aim to predict the use of contraception in Thailand, Laos, and Mongolia with data from the [Multiple Indicator Cluster Surveys (MICS)](https://mics.unicef.org/about) of the UNICEF. The datasets are individual survey responses, and user registrations are required to access the microdata. Therefore, the data are not included in this repository.
+
+The goal is to predict `use`, a binary variable that indicates whether a women of reproductive age is currently using contraception. The project report is available [here](https://yuenhsu.medium.com/predicting-contraception-use-in-asia-with-machine-learning-algorithms-d6bfab783e8).
+
+### How to obtain the data
+
+1. Register an account and download datasets from the [Survey](http://mics.unicef.org/surveys) page
+2. Unzip the file and locate the "wm" module/file
+
+The World Bank's [Microdata Library](https://microdata.worldbank.org/index.php/catalog/MICS) provides detailed data description for variable and value labels. Thailand, Laos, and Mongolia were selected because they are all in the East Asia Pacific (EAP) region, in the 6th round, and have data available.
+
+***
+
+### Load packages and data
+
+```{r start, message=FALSE}
+library(caret) # machine learning
+library(tidyverse) # data wrangling
+library(haven) # read dta file
+library(arsenal) # summary statistic table
+library(rpart.plot) # plot decision tree
+mics <- read_dta("MICS.dta")
+```
+
+```{r clean, echo=FALSE}
+mics <- mics %>% rename(
+  "age" = "AGE",
+  "edu" = "HIGHEST_EDU",
+  "nchild" = "CHILDREN_BORN",
+  "mstat" = "MARITAL_STATUS",
+  "residence" = "URBAN",
+  "country" = "COUNTRY",
+  "given_birth" = "GIVEN_BIRTH",
+  "child_died" = "CHILD_DIED",
+  "use" = "CONTRACT",
+  "wealth" = "WEALTH_PERCT"
+)
+
+# Extract number from wealth (percentile) and convert to numerical variable
+mics$wealth <- as.numeric(str_extract(mics$wealth,"\\d+"))
+
+# Factor variables
+mics$mstat <- str_replace(mics$mstat, "ly married/in union","")
+mics$mstat <- str_replace(mics$mstat, " married/in union","")
+mics$mstat <- factor(mics$mstat)
+mics$edu <- factor(mics$edu)
+mics$country <- factor(mics$country)
+
+# Factor recode for clarity
+mics$use <- factor(mics$use, 
+                   levels = c(1, 0), 
+                   labels = c("Using", "Not Using"))
+
+mics$residence <- factor(mics$residence, 
+                         levels = c(1, 0), 
+                         labels = c("Urban", "Rural"))
+
+mics$given_birth <- factor(mics$given_birth, 
+                           levels = c(1, 0),
+                           labels = c("Yes", "No"))
+
+mics$child_died <- factor(mics$child_died, 
+                          levels = c(1, 0),
+                          labels = c("Yes", "No"))
+
+mics$edu <- factor(mics$edu, 
+                   levels = c("PRE-PRIMARY OR NONE", "PRIMARY",
+                              "LOWER SECONDARY", "UPPER SECONDARY", "HIGHER"),
+                   labels = c("Less than Primary", "Primary",
+                              "Lower Secondary", "Upper Secondary", 
+                              "Higher Education"))
+
+mics$country <- factor(mics$country,
+                       levels = c("THAILAND", "LAO", "MONGOLIA"),
+                       labels = c("Thailand", "Laos", "Mongolia"))
+
+mics <- mics %>% mutate(nchild=NULL)
+```
+
+```{r mics_summary}
+mics %>% glimpse()
+```
+
+There are 9 predictors. All categorical features have been factorised. Please note that `wealth` is not the monetary value of household assets but an index^1^ that ranges from 1 to 10. It is country-specific and must be paired with `country`.
+
+#### Descriptive Statistics
+
+```{r desc_stat, results="asis"}
+tableby(use~., 
+        data = mics,
+        control = tableby.control(numeric.stats = c("mean","iqr","median"),
+                                  cat.stats = c("countrowpct"),
+                                  test = FALSE)) %>%
+  summary()
+```
+
+Out of 58,356 samples, 49.74% use contraception, and 50.26% do not. The median age is 35 and 28, respectively. There are considerable differences in contraceptive use by marital status and by experience giving birth. Only 2.7% and 23.1% of never and formerly married women use contraception, while 66.1% currently married individuals does. Women who have never given birth have a significantly lower prevalence of contraceptive use (7%) than those with experience giving birth (64.4%).
+
+***
+
+### Prepare data
+
+Here, data preparation involves splitting training and testing set and setting up cross-validation. Typically, data preparation involves much more sophisticated steps in real-life application, such as dealing with missing data, selecting variables, engineering features, scaling and centering variables, etc. However, since this was my first time building models from the beginning to the end, I did not perform said steps. 
+
+#### Split training and testing set
+
+I set aside 15% of observations for the testing set, which is reserved for the final testing once the models are trained and optimised. The rest of 85% is used to develop classification models. Because I will experiment with different parameters, I also use 10-fold cross-validation on the training set to evaluate performance.
+
+```{r split_data, collapse=TRUE}
+set.seed(20)
+# Split data into testing and training according to the outcome
+train_index <- createDataPartition(mics$use,
+                                   # 85% for training
+                                   p = .85,
+                                   times = 1,
+                                   list = FALSE)
+
+micsTrain <- mics[ train_index, ]
+micsTest  <- mics[-train_index, ]
+
+# Check target distribution
+prop.table(table(mics$use)) # all
+prop.table(table(micsTrain$use)) # training set
+prop.table(table(micsTest$use)) # testing set
+```
+
+#### Create 10-fold cross-validation (cv)
+
+Typically, a simple `trainControl(method="cv", k=10)` would suffice, but the result may be different every time the command is executed. While `trainControl` provides a seed parameter for reproducibility, I had trouble setting it up and decided to use `createFolds`.
+
+```{r cv}
+set.seed(20)
+# Index for each fold
+fold_index <- createFolds(micsTrain$use,
+                          # number of folds
+                          k = 10, 
+                          # return as list
+                          list = T, 
+                          # return numbers corresponding to the positions
+                          returnTrain = T)
+
+# Cross validation command
+ctrl <- trainControl(method="cv", index = fold_index)
+
+# Store result
+cv_result <- tibble(model = character(), cv_accuracy = numeric())
+```
+
+***
+
+### Build classification models
+
+#### K-nearest neighbour
+
+```{r knn}
+set.seed(20)
+m_knn <- train(form = use~.,
+               data = micsTrain,
+               method = 'knn',
+               trControl = ctrl, 
+               tuneLength = 10)
+print(m_knn)
+```
+
+A list of integer, from 5 to 23 with an interval of two, was provided for k. The result indicates that the model using nine neighbours (k = 9) has the lowest 10-fold cross-validation error rate of 25.78 per cent.
+
+```{r knn_result}
+# Store result
+cv_result <- cv_result %>% 
+  add_row(model="KNN", 
+          cv_accuracy = m_knn$results %>% 
+            slice_max(order_by = Accuracy, n=1) %>% 
+            pull(Accuracy))
+# Plot cv accuracy
+plot(m_knn, main = "KNN 10-fold Cross-Validation")
+```
+
+
+
+#### Decision tree
+
+```{r tree}
+set.seed(20)
+m_tree <- train(
+  use ~.,
+  micsTrain,
+  method = "rpart2",
+  trControl = ctrl,
+  tuneGrid = data.frame(maxdepth = seq(1, 15, 1))
+)
+print(m_tree)
+```
+
+Cross-validation results for ten maxdepth parameters are provided below. After two, increasing tree depth does not yield improvements in error rate. The best tree (maxdepth = 2) has two splits, one for the indicator for ever given birth and one for marital status.
+
+```{r tree_result}
+# Store result
+cv_result <- cv_result %>% 
+  add_row(model="Decision Tree", 
+          cv_accuracy = m_tree$results %>% 
+            slice_max(order_by = Accuracy, n=1) %>% 
+            pull(Accuracy))
+# Plot cv accuracy
+plot(m_tree, main = 'Decision Tree CV')
+# Plot variable importance
+plot(varImp(m_tree), top = 5, main = "Decision Tree")
+```
+
+According to the model, women who have never given birth are predicted to be not using contraception. For people who had experience giving birth, if they were formerly married or in a union, the outcome is not using contraception. If they were currently or never married, the model predicted them to be using methods to avoid pregnancy. The cross-validation error rate is 25.21 per cent.
+
+```{r tree_plot}
+rpart.plot(
+  # the model with the best accuracy
+  m_tree$finalModel, 
+  # show % of obs
+  extra = 100,
+  yesno = 2)
+```
+
+
+
+#### Random forest
+
+The mtry parameter is nine for bagging and three for random forest. Both models have 500 trees. 
+
+```{r rf}
+set.seed(20)
+m_rf <- train(
+  use~.,
+  data = micsTrain,
+  trControl = ctrl,
+  method = "rf",
+  importance = T,
+  tuneGrid = data.frame(mtry = c(3, 9))
+)
+print(m_rf)
+```
+
+The 10-fold cross-validation error rate is 25.60% for bagging and 23.33% for random forest; therefore, random forest with mtry of three is selected. The following figure presents the importance measures, the mean decrease in accuracy, for the five most important variables.
+
+```{r rf_result}
+# Store result
+cv_result <- cv_result %>% 
+  add_row(model="Random Forest", 
+          cv_accuracy = m_rf$results %>% 
+            slice_max(order_by = Accuracy, n=1) %>% 
+            pull(Accuracy))
+# Variable importance
+plot(varImp(m_rf), top = 5, main = "Random Forest")
+```
+
+
+***
+
+### Compare training performance
+
+```{r compare_model}
+model_list <- resamples(
+  list(
+    KNN = m_knn,
+    DecisionTree = m_tree,
+    RandomForest = m_rf
+  )
+)
+bwplot(model_list, metric = "Accuracy")
+```
+
+Using the validation set, which contains 8,752 observations, each model is tested with unseen data.
+
+```{r pred, collapse=TRUE}
+pred_knn <- predict(m_knn, newdata = micsTest)
+postResample(pred_knn, micsTest$use) # KNN
+pred_tree <- predict(m_tree, newdata = micsTest)
+postResample(pred_tree, micsTest$use) # Decision tree
+pred_rf <- predict(m_rf, newdata = micsTest)
+postResample(pred_rf, micsTest$use) 
+```
+
+***
+
+### Conclusion
+
+Random forest has the highest accuracy of 77.56%. Decision tree scores the highest in sensitivity and negative predictive value (NPV) at 94.14% and 90.88%, respectively. That is, when a WRA is using contraception, there is a 94.14% probability that decision tree will label her as using. And when an individual is predicted to be not using contraception by the decision tree, there is a 90.88% probability that she is not using any methods to avoid pregnancy. 
+
+
+***
+
+### Reference
+^1^ The DHS Program. (2016). Wealth Index. The DHS Program. https://dhsprogram.com/topics/wealth-index/
