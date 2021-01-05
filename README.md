@@ -10,10 +10,12 @@ The goal is to predict `use`, a binary variable that indicates whether a women o
 
 ## Directory
 
-* Analysis:
+* Analysis with `caret`:
   * :mag: Just the code? [`analysis.R`](analysis.R)
   * :mag: R markdown? [`analysis.Rmd`](analysis.Rmd)
   * :mag: Markdown? [`analysis.md`](analysis.md)
+* Analysis with `tidymodels`: This is a very brief script to experiment the `tidymodels` ecosystem.
+  * [`analysis_tidymodels.R`](analysis_tidymodels.R) 
 
 
 ## Additional Material
